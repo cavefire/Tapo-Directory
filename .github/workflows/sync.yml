@@ -1,0 +1,77 @@
+name: Sync TP-Link Cloud Files
+
+on:
+  schedule:
+    # Run daily at 2:00 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch: # Allow manual trigger
+
+permissions:
+  contents: write # Required to push changes
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Fetch AWS S3 listing
+        run: |
+          docker run --rm amazon/aws-cli s3 ls --recursive download.tplinkcloud.com/ --no-sign-request > s3_listing.txt
+          echo "Fetched $(wc -l < s3_listing.txt) entries from S3"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run sync script
+        run: |
+          chmod +x sync_keys.py
+          python sync_keys.py --input s3_listing.txt
+
+      - name: Run archive script
+        run: |
+          chmod +x archive_files.py
+          python -u archive_files.py --timeout 300 || echo "Archive script failed or timed out"
+          echo "Checking for archive_stats.txt..."
+          if [ -f archive_stats.txt ]; then
+            echo "Archive stats found:"
+            cat archive_stats.txt
+          else
+            echo "WARNING: No archive_stats.txt found, creating default file"
+            echo "new_archives=0" > archive_stats.txt
+            echo "already_archived=0" >> archive_stats.txt
+            echo "failed=0" >> archive_stats.txt
+          fi
+
+      - name: Check for changes
+        id: git-check
+        run: |
+          git diff --exit-code || echo "changes=true" >> $GITHUB_OUTPUT
+
+      - name: Prepare commit message
+        if: steps.git-check.outputs.changes == 'true'
+        id: stats
+        run: |
+          NEW_URLS=$(grep new_urls sync_stats.txt | cut -d= -f2 || echo "0")
+          REMOVED_URLS=$(grep removed_urls sync_stats.txt | cut -d= -f2 || echo "0")
+          NEW_ARCHIVES=$(grep new_archives archive_stats.txt | cut -d= -f2 || echo "0")
+          echo "new_urls=$NEW_URLS" >> $GITHUB_OUTPUT
+          echo "removed_urls=$REMOVED_URLS" >> $GITHUB_OUTPUT
+          echo "new_archives=$NEW_ARCHIVES" >> $GITHUB_OUTPUT
+
+      - name: Commit and push changes
+        if: steps.git-check.outputs.changes == 'true'
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add all_keys.csv
+          git commit -m "Auto-sync: +${{ steps.stats.outputs.new_urls }} URLs, -${{ steps.stats.outputs.removed_urls }} URLs, +${{ steps.stats.outputs.new_archives }} archives [$(date +'%Y-%m-%d %H:%M:%S')]"
+          git push
+
+      - name: No changes
+        if: steps.git-check.outputs.changes != 'true'
+        run: echo "No changes detected in S3 bucket"
